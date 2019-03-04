@@ -1,14 +1,25 @@
-# -*- coding: utf-8 -*-
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 # pylint: disable=C,R,W
 # pylint: disable=invalid-unary-operand-type
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-
 from collections import OrderedDict
 from copy import deepcopy
 from datetime import datetime, timedelta
+from distutils.version import LooseVersion
 import json
 import logging
 from multiprocessing.pool import ThreadPool
@@ -19,33 +30,36 @@ from flask import escape, Markup
 from flask_appbuilder import Model
 from flask_appbuilder.models.decorators import renders
 from flask_babel import lazy_gettext as _
+import pandas
 from pydruid.client import PyDruid
 from pydruid.utils.aggregators import count
-from pydruid.utils.filters import Bound, Dimension, Filter
+from pydruid.utils.dimensions import MapLookupExtraction, RegexExtraction
+from pydruid.utils.filters import Dimension, Filter
 from pydruid.utils.having import Aggregation
 from pydruid.utils.postaggregator import (
     Const, Field, HyperUniqueCardinality, Postaggregator, Quantile, Quantiles,
 )
 import requests
-from six import string_types
 import sqlalchemy as sa
 from sqlalchemy import (
-    Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint,
+    Boolean, Column, DateTime, ForeignKey, Integer, String, Table, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import backref, relationship
 
-from superset import conf, db, import_util, security_manager, utils
+from superset import conf, db, security_manager
 from superset.connectors.base.models import BaseColumn, BaseDatasource, BaseMetric
 from superset.exceptions import MetricPermException, SupersetException
 from superset.models.helpers import (
-    AuditMixinNullable, ImportMixin, QueryResult, set_perm,
+    AuditMixinNullable, ImportMixin, QueryResult,
 )
-from superset.utils import (
+from superset.utils import core as utils, import_datasource
+from superset.utils.core import (
     DimSelector, DTTM_ALIAS, flasher,
 )
 
 DRUID_TZ = conf.get('DRUID_TZ')
 POST_AGG_TYPE = 'postagg'
+metadata = Model.metadata  # pylint: disable=no-member
 
 
 # Function wrapper because bound methods cannot
@@ -83,19 +97,15 @@ class DruidCluster(Model, AuditMixinNullable, ImportMixin):
     verbose_name = Column(String(250), unique=True)
     # short unique name, used in permissions
     cluster_name = Column(String(250), unique=True)
-    coordinator_host = Column(String(255))
-    coordinator_port = Column(Integer, default=8081)
-    coordinator_endpoint = Column(
-        String(255), default='druid/coordinator/v1/metadata')
     broker_host = Column(String(255))
     broker_port = Column(Integer, default=8082)
     broker_endpoint = Column(String(255), default='druid/v2')
     metadata_last_refreshed = Column(DateTime)
     cache_timeout = Column(Integer)
 
-    export_fields = ('cluster_name', 'coordinator_host', 'coordinator_port',
-                     'coordinator_endpoint', 'broker_host', 'broker_port',
+    export_fields = ('cluster_name', 'broker_host', 'broker_port',
                      'broker_endpoint', 'cache_timeout')
+    update_from_object_fields = export_fields
     export_children = ['datasources']
 
     def __repr__(self):
@@ -107,6 +117,7 @@ class DruidCluster(Model, AuditMixinNullable, ImportMixin):
     @property
     def data(self):
         return {
+            'id': self.id,
             'name': self.cluster_name,
             'backend': 'druid',
         }
@@ -115,12 +126,14 @@ class DruidCluster(Model, AuditMixinNullable, ImportMixin):
     def get_base_url(host, port):
         if not re.match('http(s)?://', host):
             host = 'http://' + host
-        return '{0}:{1}'.format(host, port)
 
-    def get_base_coordinator_url(self):
+        url = '{0}:{1}'.format(host, port) if port else host
+        return url
+
+    def get_base_broker_url(self):
         base_url = self.get_base_url(
-            self.coordinator_host, self.coordinator_port)
-        return '{base_url}/{self.coordinator_endpoint}'.format(**locals())
+            self.broker_host, self.broker_port)
+        return f'{base_url}/{self.broker_endpoint}'
 
     def get_pydruid_client(self):
         cli = PyDruid(
@@ -129,13 +142,18 @@ class DruidCluster(Model, AuditMixinNullable, ImportMixin):
         return cli
 
     def get_datasources(self):
-        endpoint = self.get_base_coordinator_url() + '/datasources'
+        endpoint = self.get_base_broker_url() + '/datasources'
         return json.loads(requests.get(endpoint).text)
 
     def get_druid_version(self):
         endpoint = self.get_base_url(
-            self.coordinator_host, self.coordinator_port) + '/status'
+            self.broker_host, self.broker_port) + '/status'
         return json.loads(requests.get(endpoint).text)['version']
+
+    @property
+    @utils.memoized
+    def druid_version(self):
+        return self.get_druid_version()
 
     def refresh_datasources(
             self,
@@ -145,7 +163,6 @@ class DruidCluster(Model, AuditMixinNullable, ImportMixin):
         """Refresh metadata of all datasources in the cluster
         If ``datasource_name`` is specified, only that datasource is updated
         """
-        self.druid_version = self.get_druid_version()
         ds_list = self.get_datasources()
         blacklist = conf.get('DRUID_DATA_SOURCE_BLACKLIST', [])
         ds_refresh = []
@@ -176,11 +193,11 @@ class DruidCluster(Model, AuditMixinNullable, ImportMixin):
                 with session.no_autoflush:
                     session.add(datasource)
                 flasher(
-                    'Adding new datasource [{}]'.format(ds_name), 'success')
+                    _('Adding new datasource [{}]').format(ds_name), 'success')
                 ds_map[ds_name] = datasource
             elif refreshAll:
                 flasher(
-                    'Refreshing datasource [{}]'.format(ds_name), 'info')
+                    _('Refreshing datasource [{}]').format(ds_name), 'info')
             else:
                 del ds_map[ds_name]
                 continue
@@ -220,12 +237,6 @@ class DruidCluster(Model, AuditMixinNullable, ImportMixin):
                     if col_obj.type == 'STRING':
                         col_obj.groupby = True
                         col_obj.filterable = True
-                    if col_obj.type == 'hyperUnique' or col_obj.type == 'thetaSketch':
-                        col_obj.count_distinct = True
-                    if col_obj.is_num:
-                        col_obj.sum = True
-                        col_obj.min = True
-                        col_obj.max = True
                 datasource.refresh_metrics()
         session.commit()
 
@@ -263,9 +274,9 @@ class DruidColumn(Model, BaseColumn):
 
     export_fields = (
         'datasource_id', 'column_name', 'is_active', 'type', 'groupby',
-        'count_distinct', 'sum', 'avg', 'max', 'min', 'filterable',
-        'description', 'dimension_spec_json', 'verbose_name',
+        'filterable', 'description', 'dimension_spec_json', 'verbose_name',
     )
+    update_from_object_fields = export_fields
     export_parent = 'datasource'
 
     def __repr__(self):
@@ -288,77 +299,6 @@ class DruidColumn(Model, BaseColumn):
             metric_type='count',
             json=json.dumps({'type': 'count', 'name': 'count'}),
         )
-        # Somehow we need to reassign this for UDAFs
-        if self.type in ('DOUBLE', 'FLOAT'):
-            corrected_type = 'DOUBLE'
-        else:
-            corrected_type = self.type
-
-        if self.sum and self.is_num:
-            mt = corrected_type.lower() + 'Sum'
-            name = 'sum__' + self.column_name
-            metrics[name] = DruidMetric(
-                metric_name=name,
-                metric_type='sum',
-                verbose_name='SUM({})'.format(self.column_name),
-                json=json.dumps({
-                    'type': mt, 'name': name, 'fieldName': self.column_name}),
-            )
-
-        if self.avg and self.is_num:
-            mt = corrected_type.lower() + 'Avg'
-            name = 'avg__' + self.column_name
-            metrics[name] = DruidMetric(
-                metric_name=name,
-                metric_type='avg',
-                verbose_name='AVG({})'.format(self.column_name),
-                json=json.dumps({
-                    'type': mt, 'name': name, 'fieldName': self.column_name}),
-            )
-
-        if self.min and self.is_num:
-            mt = corrected_type.lower() + 'Min'
-            name = 'min__' + self.column_name
-            metrics[name] = DruidMetric(
-                metric_name=name,
-                metric_type='min',
-                verbose_name='MIN({})'.format(self.column_name),
-                json=json.dumps({
-                    'type': mt, 'name': name, 'fieldName': self.column_name}),
-            )
-        if self.max and self.is_num:
-            mt = corrected_type.lower() + 'Max'
-            name = 'max__' + self.column_name
-            metrics[name] = DruidMetric(
-                metric_name=name,
-                metric_type='max',
-                verbose_name='MAX({})'.format(self.column_name),
-                json=json.dumps({
-                    'type': mt, 'name': name, 'fieldName': self.column_name}),
-            )
-        if self.count_distinct:
-            name = 'count_distinct__' + self.column_name
-            if self.type == 'hyperUnique' or self.type == 'thetaSketch':
-                metrics[name] = DruidMetric(
-                    metric_name=name,
-                    verbose_name='COUNT(DISTINCT {})'.format(self.column_name),
-                    metric_type=self.type,
-                    json=json.dumps({
-                        'type': self.type,
-                        'name': name,
-                        'fieldName': self.column_name,
-                    }),
-                )
-            else:
-                metrics[name] = DruidMetric(
-                    metric_name=name,
-                    verbose_name='COUNT(DISTINCT {})'.format(self.column_name),
-                    metric_type='count_distinct',
-                    json=json.dumps({
-                        'type': 'cardinality',
-                        'name': name,
-                        'fieldNames': [self.column_name]}),
-                )
         return metrics
 
     def refresh_metrics(self):
@@ -387,7 +327,7 @@ class DruidColumn(Model, BaseColumn):
                 DruidColumn.datasource_id == lookup_column.datasource_id,
                 DruidColumn.column_name == lookup_column.column_name).first()
 
-        return import_util.import_simple_obj(db.session, i_column, lookup_obj)
+        return import_datasource.import_simple_obj(db.session, i_column, lookup_obj)
 
 
 class DruidMetric(Model, BaseMetric):
@@ -408,8 +348,9 @@ class DruidMetric(Model, BaseMetric):
 
     export_fields = (
         'metric_name', 'verbose_name', 'metric_type', 'datasource_id',
-        'json', 'description', 'is_restricted', 'd3format',
+        'json', 'description', 'is_restricted', 'd3format', 'warning_text',
     )
+    update_from_object_fields = export_fields
     export_parent = 'datasource'
 
     @property
@@ -432,13 +373,24 @@ class DruidMetric(Model, BaseMetric):
                  parent_name=self.datasource.full_name,
                  ) if self.datasource else None
 
+    def get_perm(self):
+        return self.perm
+
     @classmethod
     def import_obj(cls, i_metric):
         def lookup_obj(lookup_metric):
             return db.session.query(DruidMetric).filter(
                 DruidMetric.datasource_id == lookup_metric.datasource_id,
                 DruidMetric.metric_name == lookup_metric.metric_name).first()
-        return import_util.import_simple_obj(db.session, i_metric, lookup_obj)
+        return import_datasource.import_simple_obj(db.session, i_metric, lookup_obj)
+
+
+druiddatasource_user = Table(
+    'druiddatasource_user', metadata,
+    Column('id', Integer, primary_key=True),
+    Column('user_id', Integer, ForeignKey('ab_user.id')),
+    Column('datasource_id', Integer, ForeignKey('datasources.id')),
+)
 
 
 class DruidDatasource(Model, BaseDatasource):
@@ -453,6 +405,7 @@ class DruidDatasource(Model, BaseDatasource):
     cluster_class = DruidCluster
     metric_class = DruidMetric
     column_class = DruidColumn
+    owner_class = security_manager.user_model
 
     baselink = 'druiddatasourcemodelview'
 
@@ -465,17 +418,16 @@ class DruidDatasource(Model, BaseDatasource):
         String(250), ForeignKey('clusters.cluster_name'))
     cluster = relationship(
         'DruidCluster', backref='datasources', foreign_keys=[cluster_name])
-    user_id = Column(Integer, ForeignKey('ab_user.id'))
-    owner = relationship(
-        security_manager.user_model,
-        backref=backref('datasources', cascade='all, delete-orphan'),
-        foreign_keys=[user_id])
+    owners = relationship(owner_class, secondary=druiddatasource_user,
+                          backref='druiddatasources')
     UniqueConstraint('cluster_name', 'datasource_name')
 
     export_fields = (
         'datasource_name', 'is_hidden', 'description', 'default_endpoint',
         'cluster_name', 'offset', 'cache_timeout', 'params',
+        'filter_select_enabled',
     )
+    update_from_object_fields = export_fields
 
     export_parent = 'cluster'
     export_children = ['columns', 'metrics']
@@ -515,10 +467,13 @@ class DruidDatasource(Model, BaseDatasource):
             '[{obj.cluster_name}].[{obj.datasource_name}]'
             '(id:{obj.id})').format(obj=self)
 
+    def update_from_object(self, obj):
+        return NotImplementedError()
+
     @property
     def link(self):
         name = escape(self.datasource_name)
-        return Markup('<a href="{self.url}">{name}</a>').format(**locals())
+        return Markup(f'<a href="{self.url}">{name}</a>')
 
     @property
     def full_name(self):
@@ -529,10 +484,10 @@ class DruidDatasource(Model, BaseDatasource):
     def time_column_grains(self):
         return {
             'time_columns': [
-                'all', '5 seconds', '30 seconds', '1 minute',
-                '5 minutes', '1 hour', '6 hour', '1 day', '7 days',
+                'all', '5 seconds', '30 seconds', '1 minute', '5 minutes',
+                '30 minutes', '1 hour', '6 hour', '1 day', '7 days',
                 'week', 'week_starting_sunday', 'week_ending_saturday',
-                'month',
+                'month', 'quarter', 'year',
             ],
             'time_grains': ['now'],
         }
@@ -542,9 +497,9 @@ class DruidDatasource(Model, BaseDatasource):
 
     @renders('datasource_name')
     def datasource_link(self):
-        url = '/superset/explore/{obj.type}/{obj.id}/'.format(obj=self)
+        url = f'/superset/explore/{self.type}/{self.id}/'
         name = escape(self.datasource_name)
-        return Markup('<a href="{url}">{name}</a>'.format(**locals()))
+        return Markup(f'<a href="{url}">{name}</a>')
 
     def get_metric_obj(self, metric_name):
         return [
@@ -569,41 +524,9 @@ class DruidDatasource(Model, BaseDatasource):
         def lookup_cluster(d):
             return db.session.query(DruidCluster).filter_by(
                 cluster_name=d.cluster_name).one()
-        return import_util.import_datasource(
+        return import_datasource.import_datasource(
             db.session, i_datasource, lookup_cluster, lookup_datasource,
             import_time)
-
-    @staticmethod
-    def version_higher(v1, v2):
-        """is v1 higher than v2
-
-        >>> DruidDatasource.version_higher('0.8.2', '0.9.1')
-        False
-        >>> DruidDatasource.version_higher('0.8.2', '0.6.1')
-        True
-        >>> DruidDatasource.version_higher('0.8.2', '0.8.2')
-        False
-        >>> DruidDatasource.version_higher('0.8.2', '0.9.BETA')
-        False
-        >>> DruidDatasource.version_higher('0.8.2', '0.9')
-        False
-        """
-        def int_or_0(v):
-            try:
-                v = int(v)
-            except (TypeError, ValueError):
-                v = 0
-            return v
-        v1nums = [int_or_0(n) for n in v1.split('.')]
-        v2nums = [int_or_0(n) for n in v2.split('.')]
-        v1nums = (v1nums + [0, 0, 0])[:3]
-        v2nums = (v2nums + [0, 0, 0])[:3]
-        return (
-            v1nums[0] > v2nums[0] or
-            (v1nums[0] == v2nums[0] and v1nums[1] > v2nums[1]) or
-            (v1nums[0] == v2nums[0] and v1nums[1] == v2nums[1] and
-                v1nums[2] > v2nums[2])
-        )
 
     def latest_metadata(self):
         """Returns segment metadata from the latest segment"""
@@ -623,7 +546,7 @@ class DruidDatasource(Model, BaseDatasource):
         # realtime segments, which triggered a bug (fixed in druid 0.8.2).
         # https://groups.google.com/forum/#!topic/druid-user/gVCqqspHqOQ
         lbound = (max_time - timedelta(days=7)).isoformat()
-        if not self.version_higher(self.cluster.druid_version, '0.8.2'):
+        if LooseVersion(self.cluster.druid_version) < LooseVersion('0.8.2'):
             rbound = (max_time - timedelta(1)).isoformat()
         else:
             rbound = max_time.isoformat()
@@ -640,7 +563,7 @@ class DruidDatasource(Model, BaseDatasource):
         if not segment_metadata:
             # if no segments in the past 7 days, look at all segments
             lbound = datetime(1901, 1, 1).isoformat()[:10]
-            if not self.version_higher(self.cluster.druid_version, '0.8.2'):
+            if LooseVersion(self.cluster.druid_version) < LooseVersion('0.8.2'):
                 rbound = datetime.now().isoformat()
             else:
                 rbound = datetime(2050, 1, 1).isoformat()[:10]
@@ -679,7 +602,7 @@ class DruidDatasource(Model, BaseDatasource):
             datasource = cls(
                 datasource_name=druid_config['name'],
                 cluster=cluster,
-                owner=user,
+                owners=[user],
                 changed_by_fk=user.id,
                 created_by_fk=user.id,
             )
@@ -762,6 +685,7 @@ class DruidDatasource(Model, BaseDatasource):
             '30 seconds': 'PT30S',
             '1 minute': 'PT1M',
             '5 minutes': 'PT5M',
+            '30 minutes': 'PT30M',
             '1 hour': 'PT1H',
             '6 hour': 'PT6H',
             'one day': 'P1D',
@@ -771,6 +695,8 @@ class DruidDatasource(Model, BaseDatasource):
             'week_starting_sunday': 'P1W',
             'week_ending_saturday': 'P1W',
             'month': 'P1M',
+            'quarter': 'P3M',
+            'year': 'P1Y',
         }
 
         granularity = {'type': 'period'}
@@ -786,7 +712,7 @@ class DruidDatasource(Model, BaseDatasource):
             if period_name in ('week_ending_saturday', 'week_starting_sunday'):
                 # use Sunday as start of the week
                 granularity['origin'] = '2016-01-03T00:00:00'
-        elif not isinstance(period_name, string_types):
+        elif not isinstance(period_name, str):
             granularity['type'] = 'duration'
             granularity['duration'] = period_name
         elif period_name.startswith('P'):
@@ -895,8 +821,8 @@ class DruidDatasource(Model, BaseDatasource):
                     missing_postagg, post_aggs, agg_names, visited_postaggs, metrics_dict)
         post_aggs[postagg.metric_name] = DruidDatasource.get_post_agg(postagg.json_obj)
 
-    @classmethod
-    def metrics_and_post_aggs(cls, metrics, metrics_dict):
+    @staticmethod
+    def metrics_and_post_aggs(metrics, metrics_dict, druid_version=None):
         # Separate metrics into those that are aggregations
         # and those that are post aggregations
         saved_agg_names = set()
@@ -916,9 +842,13 @@ class DruidDatasource(Model, BaseDatasource):
         for postagg_name in postagg_names:
             postagg = metrics_dict[postagg_name]
             visited_postaggs.add(postagg_name)
-            cls.resolve_postagg(
+            DruidDatasource.resolve_postagg(
                 postagg, post_aggs, saved_agg_names, visited_postaggs, metrics_dict)
-        aggs = cls.get_aggregations(metrics_dict, saved_agg_names, adhoc_agg_configs)
+        aggs = DruidDatasource.get_aggregations(
+            metrics_dict,
+            saved_agg_names,
+            adhoc_agg_configs,
+        )
         return aggs, post_aggs
 
     def values_for_column(self,
@@ -959,8 +889,25 @@ class DruidDatasource(Model, BaseDatasource):
             for unused, row in df.iterrows():
                 fields = []
                 for dim in dimensions:
-                    f = Dimension(dim) == row[dim]
-                    fields.append(f)
+                    f = None
+                    # Check if this dimension uses an extraction function
+                    # If so, create the appropriate pydruid extraction object
+                    if isinstance(dim, dict) and 'extractionFn' in dim:
+                        (col, extraction_fn) = DruidDatasource._create_extraction_fn(dim)
+                        dim_val = dim['outputName']
+                        f = Filter(
+                            dimension=col,
+                            value=row[dim_val],
+                            extraction_function=extraction_fn,
+                        )
+                    elif isinstance(dim, dict):
+                        dim_val = dim['outputName']
+                        if dim_val:
+                            f = Dimension(dim_val) == row[dim_val]
+                    else:
+                        f = Dimension(dim) == row[dim]
+                    if f:
+                        fields.append(f)
                 if len(fields) > 1:
                     term = Filter(type='and', fields=fields)
                     new_filters.append(term)
@@ -976,11 +923,12 @@ class DruidDatasource(Model, BaseDatasource):
 
     @staticmethod
     def druid_type_from_adhoc_metric(adhoc_metric):
-        column_type = adhoc_metric.get('column').get('type').lower()
-        aggregate = adhoc_metric.get('aggregate').lower()
-        if (aggregate == 'count'):
+        column_type = adhoc_metric['column']['type'].lower()
+        aggregate = adhoc_metric['aggregate'].lower()
+
+        if aggregate == 'count':
             return 'count'
-        if (aggregate == 'count_distinct'):
+        if aggregate == 'count_distinct':
             return 'cardinality'
         else:
             return column_type + aggregate.capitalize()
@@ -1064,12 +1012,26 @@ class DruidDatasource(Model, BaseDatasource):
         values = []
         for dimension in dimensions:
             if isinstance(dimension, dict):
-                if 'dimension' in dimension:
+                if 'extractionFn' in dimension:
+                    values.append(dimension)
+                elif 'dimension' in dimension:
                     values.append(dimension['dimension'])
             else:
                 values.append(dimension)
 
         return values
+
+    @staticmethod
+    def sanitize_metric_object(metric):
+        """
+        Update a metric with the correct type if necessary.
+        :param dict metric: The metric to sanitize
+        """
+        if (
+            utils.is_adhoc_metric(metric) and
+            metric['column']['type'].upper() == 'FLOAT'
+        ):
+            metric['column']['type'] = 'DOUBLE'
 
     def run_query(  # noqa / druid
             self,
@@ -1109,6 +1071,14 @@ class DruidDatasource(Model, BaseDatasource):
         metrics_dict = {m.metric_name: m for m in self.metrics}
         columns_dict = {c.column_name: c for c in self.columns}
 
+        if (
+            self.cluster and
+            LooseVersion(self.cluster.get_druid_version()) < LooseVersion('0.11.0')
+        ):
+            for metric in metrics:
+                self.sanitize_metric_object(metric)
+            self.sanitize_metric_object(timeseries_limit_metric)
+
         aggregations, post_aggs = DruidDatasource.metrics_and_post_aggs(
             metrics,
             metrics_dict)
@@ -1131,7 +1101,7 @@ class DruidDatasource(Model, BaseDatasource):
             intervals=self.intervals_from_dttms(from_dttm, to_dttm),
         )
 
-        filters = DruidDatasource.get_filters(filter, self.num_cols)
+        filters = DruidDatasource.get_filters(filter, self.num_cols, columns_dict)
         if filters:
             qry['filter'] = filters
 
@@ -1163,8 +1133,8 @@ class DruidDatasource(Model, BaseDatasource):
             logging.info('Running two-phase topn query for dimension [{}]'.format(dim))
             pre_qry = deepcopy(qry)
             if timeseries_limit_metric:
-                order_by = timeseries_limit_metric
-                aggs_dict, post_aggs_dict = self.metrics_and_post_aggs(
+                order_by = utils.get_metric_name(timeseries_limit_metric)
+                aggs_dict, post_aggs_dict = DruidDatasource.metrics_and_post_aggs(
                     [timeseries_limit_metric],
                     metrics_dict)
                 if phase == 1:
@@ -1216,13 +1186,24 @@ class DruidDatasource(Model, BaseDatasource):
 
                 pre_qry = deepcopy(qry)
                 pre_qry_dims = self._dimensions_to_values(qry['dimensions'])
-                pre_qry['dimensions'] = list(set(pre_qry_dims))
 
-                order_by = metrics[0] if metrics else pre_qry_dims[0]
+                # Can't use set on an array with dicts
+                # Use set with non-dict items only
+                non_dict_dims = list(
+                    set([x for x in pre_qry_dims if not isinstance(x, dict)]),
+                )
+                dict_dims = [x for x in pre_qry_dims if isinstance(x, dict)]
+                pre_qry['dimensions'] = non_dict_dims + dict_dims
+
+                order_by = None
+                if metrics:
+                    order_by = utils.get_metric_name(metrics[0])
+                else:
+                    order_by = pre_qry_dims[0]
 
                 if timeseries_limit_metric:
-                    order_by = timeseries_limit_metric
-                    aggs_dict, post_aggs_dict = self.metrics_and_post_aggs(
+                    order_by = utils.get_metric_name(timeseries_limit_metric)
+                    aggs_dict, post_aggs_dict = DruidDatasource.metrics_and_post_aggs(
                         [timeseries_limit_metric],
                         metrics_dict)
                     if phase == 1:
@@ -1268,7 +1249,10 @@ class DruidDatasource(Model, BaseDatasource):
                     'limit': row_limit,
                     'columns': [{
                         'dimension': (
-                            metrics[0] if metrics else dimension_values[0]),
+                            utils.get_metric_name(
+                                metrics[0],
+                            ) if metrics else dimension_values[0]
+                        ),
                         'direction': order_direction,
                     }],
                 }
@@ -1290,7 +1274,7 @@ class DruidDatasource(Model, BaseDatasource):
         str instead of an object.
         """
         for col in groupby_cols:
-            df[col] = df[col].fillna('<NULL>').astype(str)
+            df[col] = df[col].fillna('<NULL>').astype('unicode')
         return df
 
     def query(self, query_obj):
@@ -1300,12 +1284,17 @@ class DruidDatasource(Model, BaseDatasource):
             client=client, query_obj=query_obj, phase=2)
         df = client.export_pandas()
 
-        df = self.homogenize_types(df, query_obj.get('groupby', []))
-
         if df is None or df.size == 0:
-            raise Exception(_('No data was returned.'))
+            return QueryResult(
+                df=pandas.DataFrame([]),
+                query=query_str,
+                duration=datetime.now() - qry_start_dttm)
+
+        df = self.homogenize_types(df, query_obj.get('groupby', []))
         df.columns = [
-            DTTM_ALIAS if c == 'timestamp' else c for c in df.columns]
+            DTTM_ALIAS if c in ('timestamp', '__time') else c
+            for c in df.columns
+        ]
 
         is_timeseries = query_obj['is_timeseries'] \
             if 'is_timeseries' in query_obj else True
@@ -1340,8 +1329,31 @@ class DruidDatasource(Model, BaseDatasource):
             query=query_str,
             duration=datetime.now() - qry_start_dttm)
 
+    @staticmethod
+    def _create_extraction_fn(dim_spec):
+        extraction_fn = None
+        if dim_spec and 'extractionFn' in dim_spec:
+            col = dim_spec['dimension']
+            fn = dim_spec['extractionFn']
+            ext_type = fn.get('type')
+            if ext_type == 'lookup' and fn['lookup'].get('type') == 'map':
+                replace_missing_values = fn.get('replaceMissingValueWith')
+                retain_missing_values = fn.get('retainMissingValue', False)
+                injective = fn.get('isOneToOne', False)
+                extraction_fn = MapLookupExtraction(
+                    fn['lookup']['map'],
+                    replace_missing_values=replace_missing_values,
+                    retain_missing_values=retain_missing_values,
+                    injective=injective,
+                )
+            elif ext_type == 'regex':
+                extraction_fn = RegexExtraction(fn['expr'])
+            else:
+                raise Exception(_('Unsupported extraction function: ' + ext_type))
+        return (col, extraction_fn)
+
     @classmethod
-    def get_filters(cls, raw_filters, num_cols):  # noqa
+    def get_filters(cls, raw_filters, num_cols, columns_dict):  # noqa
         """Given Superset filter data structure, returns pydruid Filter(s)"""
         filters = None
         for flt in raw_filters:
@@ -1353,21 +1365,42 @@ class DruidDatasource(Model, BaseDatasource):
                     not op or
                     (eq is None and op not in ('IS NULL', 'IS NOT NULL'))):
                 continue
+
+            # Check if this dimension uses an extraction function
+            # If so, create the appropriate pydruid extraction object
+            column_def = columns_dict.get(col)
+            dim_spec = column_def.dimension_spec if column_def else None
+            extraction_fn = None
+            if dim_spec and 'extractionFn' in dim_spec:
+                (col, extraction_fn) = DruidDatasource._create_extraction_fn(dim_spec)
+
             cond = None
             is_numeric_col = col in num_cols
             is_list_target = op in ('in', 'not in')
             eq = cls.filter_values_handler(
                 eq, is_list_target=is_list_target,
                 target_column_is_numeric=is_numeric_col)
+
+            # For these two ops, could have used Dimension,
+            # but it doesn't support extraction functions
             if op == '==':
-                cond = Dimension(col) == eq
+                cond = Filter(dimension=col, value=eq, extraction_function=extraction_fn)
             elif op == '!=':
-                cond = Dimension(col) != eq
+                cond = ~Filter(dimension=col, value=eq, extraction_function=extraction_fn)
             elif op in ('in', 'not in'):
                 fields = []
                 # ignore the filter if it has no value
                 if not len(eq):
                     continue
+                # if it uses an extraction fn, use the "in" operator
+                # as Dimension isn't supported
+                elif extraction_fn is not None:
+                    cond = Filter(
+                        dimension=col,
+                        values=eq,
+                        type='in',
+                        extraction_function=extraction_fn,
+                    )
                 elif len(eq) == 1:
                     cond = Dimension(col) == eq[0]
                 else:
@@ -1377,20 +1410,58 @@ class DruidDatasource(Model, BaseDatasource):
                 if op == 'not in':
                     cond = ~cond
             elif op == 'regex':
-                cond = Filter(type='regex', pattern=eq, dimension=col)
+                cond = Filter(
+                    extraction_function=extraction_fn,
+                    type='regex',
+                    pattern=eq,
+                    dimension=col,
+                )
+
+            # For the ops below, could have used pydruid's Bound,
+            # but it doesn't support extraction functions
             elif op == '>=':
-                cond = Bound(col, eq, None, alphaNumeric=is_numeric_col)
+                cond = Filter(
+                    type='bound',
+                    extraction_function=extraction_fn,
+                    dimension=col,
+                    lowerStrict=False,
+                    upperStrict=False,
+                    lower=eq,
+                    upper=None,
+                    alphaNumeric=is_numeric_col,
+                )
             elif op == '<=':
-                cond = Bound(col, None, eq, alphaNumeric=is_numeric_col)
+                cond = Filter(
+                    type='bound',
+                    extraction_function=extraction_fn,
+                    dimension=col,
+                    lowerStrict=False,
+                    upperStrict=False,
+                    lower=None,
+                    upper=eq,
+                    alphaNumeric=is_numeric_col,
+                )
             elif op == '>':
-                cond = Bound(
-                    col, eq, None,
-                    lowerStrict=True, alphaNumeric=is_numeric_col,
+                cond = Filter(
+                    type='bound',
+                    extraction_function=extraction_fn,
+                    lowerStrict=True,
+                    upperStrict=False,
+                    dimension=col,
+                    lower=eq,
+                    upper=None,
+                    alphaNumeric=is_numeric_col,
                 )
             elif op == '<':
-                cond = Bound(
-                    col, None, eq,
-                    upperStrict=True, alphaNumeric=is_numeric_col,
+                cond = Filter(
+                    type='bound',
+                    extraction_function=extraction_fn,
+                    upperStrict=True,
+                    lowerStrict=False,
+                    dimension=col,
+                    lower=None,
+                    upper=eq,
+                    alphaNumeric=is_numeric_col,
                 )
             elif op == 'IS NULL':
                 cond = Dimension(col) == None  # NOQA
@@ -1457,6 +1528,16 @@ class DruidDatasource(Model, BaseDatasource):
             .all()
         )
 
+    def external_metadata(self):
+        self.merge_flag = True
+        return [
+            {
+                'name': k,
+                'type': v.get('type'),
+            }
+            for k, v in self.latest_metadata().items()
+        ]
 
-sa.event.listen(DruidDatasource, 'after_insert', set_perm)
-sa.event.listen(DruidDatasource, 'after_update', set_perm)
+
+sa.event.listen(DruidDatasource, 'after_insert', security_manager.set_perm)
+sa.event.listen(DruidDatasource, 'after_update', security_manager.set_perm)
